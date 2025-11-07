@@ -1,0 +1,22 @@
+# Test configuration for flamegraph feature
+debugMode: true
+address: ":10249"
+
+event:
+  sinks:
+    - name: flame
+    - name: stderr  # Also log to stderr for debugging
+  
+  probes:
+    - name: packetloss
+      args:
+        EnableStack: true  # Required to collect kernel stacks
+    - name: tcpretrans
+    - name: tcpreset
+
+metrics:
+  probes:
+    - name: packetloss
+    - name: tcpretrans
+    - name: tcpreset
+
