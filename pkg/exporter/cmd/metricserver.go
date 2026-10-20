@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/alibaba/kubeskoop/pkg/exporter/probe"
 	"github.com/alibaba/kubeskoop/pkg/exporter/util"
@@ -11,21 +13,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func newMetricsServer() (*MetricsServer, error) {
+const metricsWriteTimeout = 30 * time.Second
+
+func newMetricsServer(config MetricsConfig) (*MetricsServer, error) {
 
 	r := prometheus.NewRegistry()
-	handler := promhttp.HandlerFor(prometheus.Gatherers{
-		r,
-	}, promhttp.HandlerOpts{})
 
 	probeManager := &MetricsProbeManager{
 		prometheusRegistry: r,
 	}
 
-	return &MetricsServer{
+	server := &MetricsServer{
 		DynamicProbeServer: NewDynamicProbeServer[probe.MetricsProbe](probeManager),
-		httpHandler:        handler,
-	}, nil
+		prometheusRegistry: r,
+	}
+	server.SetDisableCompression(config.DisableCompression)
+	return server, nil
 }
 
 type MetricsProbeManager struct {
@@ -65,9 +68,29 @@ var _ ProbeManager[probe.MetricsProbe] = &MetricsProbeManager{}
 
 type MetricsServer struct {
 	*DynamicProbeServer[probe.MetricsProbe]
-	httpHandler http.Handler
+	prometheusRegistry *prometheus.Registry
+	httpHandler        atomic.Value
+	writeTimeout       time.Duration
+}
+
+func (s *MetricsServer) SetDisableCompression(disable bool) {
+	handler := promhttp.HandlerFor(prometheus.Gatherers{
+		s.prometheusRegistry,
+	}, promhttp.HandlerOpts{DisableCompression: disable})
+	s.httpHandler.Store(handler)
 }
 
 func (s *MetricsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.httpHandler.ServeHTTP(w, r)
+	// Bound writes on this response only. A write deadline does not interrupt
+	// Gather, and concurrent scrapes are handled independently.
+	// Keep other endpoints, such as long-running CPU profiles, unaffected.
+	timeout := s.writeTimeout
+	if timeout <= 0 {
+		timeout = metricsWriteTimeout
+	}
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		log.Debugf("cannot set metrics response write deadline: %v", err)
+	}
+
+	s.httpHandler.Load().(http.Handler).ServeHTTP(w, r)
 }

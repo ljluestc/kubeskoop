@@ -1,10 +1,14 @@
 package procio
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -22,7 +26,16 @@ const (
 	IOWriteBytes   = "writebytes"
 
 	probeName = "io" // nolint
+
+	maxProcIOBufferSize = 1024 * 512
 )
+
+var procIOBufferPool = sync.Pool{New: func() interface{} {
+	buf := make([]byte, 0, 512)
+	return &buf
+}}
+
+func noopPutBuffer() {}
 
 func init() {
 	probe.MustRegisterMetricsProbe(probeName, ioProbeCreator)
@@ -70,59 +83,161 @@ func (s *ProcIO) collectOnce(emit probe.Emit) error {
 }
 
 func collectProcessIO(entity *nettop.Entity, emit probe.Emit) {
-	var (
-		readSyscall  uint64
-		writeSyscall uint64
-		readBytes    uint64
-		writeBytes   uint64
-	)
-	for _, pid := range entity.GetPids() {
-		iodata, err := getProcessIOStat(pid)
-		if err != nil {
-			log.Warningf("probe %s: failed get process io data: %v", probeName, err)
-			continue
-		}
-
-		readSyscall += iodata.SyscR
-		writeSyscall += iodata.SyscW
-		readBytes += iodata.ReadBytes
-		writeBytes += iodata.WriteBytes
-	}
+	stats := collectProcessIOStats("/proc", entity.GetPids())
 	labels := probe.BuildStandardMetricsLabelValues(entity)
-	emit(IOReadSyscall, labels, float64(readSyscall))
-	emit(IOWriteSyscall, labels, float64(writeSyscall))
-	emit(IOReadBytes, labels, float64(readBytes))
-	emit(IOWriteBytes, labels, float64(writeBytes))
+	emit(IOReadSyscall, labels, float64(stats.SyscR))
+	emit(IOWriteSyscall, labels, float64(stats.SyscW))
+	emit(IOReadBytes, labels, float64(stats.ReadBytes))
+	emit(IOWriteBytes, labels, float64(stats.WriteBytes))
 }
 
-// IO creates a new ProcIO instance from a given Proc instance.
-func getProcessIOStat(pid int) (procfs.ProcIO, error) {
-	pio := procfs.ProcIO{}
+func collectProcessIOStats(procRoot string, tids []int) procfs.ProcIO {
+	var total procfs.ProcIO
+	seen := make(map[int]struct{})
+	for _, tid := range tids {
+		tgid, err := getThreadGroupID(procRoot, tid)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Warningf("probe %s: failed get thread group: %v", probeName, err)
+			}
+			continue
+		}
+		if _, ok := seen[tgid]; ok {
+			continue
+		}
+		// /proc/<tid>/io reports the whole thread group's counters, even for
+		// non-leader threads. Read it only once per process. Use the live TID
+		// rather than the leader, which may already have exited.
+		stats, err := getProcessIOStat(procRoot, tid)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Warningf("probe %s: failed get process io data: %v", probeName, err)
+			}
+			continue
+		}
+		seen[tgid] = struct{}{}
+		total.SyscR += stats.SyscR
+		total.SyscW += stats.SyscW
+		total.ReadBytes += stats.ReadBytes
+		total.WriteBytes += stats.WriteBytes
+	}
+	return total
+}
 
-	data, err := readFileNoStat(fmt.Sprintf("/proc/%d/io", pid))
+func getThreadGroupID(procRoot string, tid int) (int, error) {
+	data, putBuffer, err := readFileNoStat(filepath.Join(procRoot, strconv.Itoa(tid), "status"))
+	if err != nil {
+		return 0, err
+	}
+	defer putBuffer()
+	for len(data) > 0 {
+		line, rest, _ := bytes.Cut(data, []byte("\n"))
+		data = rest
+		key, value, ok := bytes.Cut(line, []byte(":"))
+		if !ok || !bytes.Equal(key, []byte("Tgid")) {
+			continue
+		}
+		tgid, err := strconv.Atoi(string(bytes.TrimSpace(value)))
+		if err != nil || tgid <= 0 {
+			return 0, fmt.Errorf("invalid Tgid for task %d: %q", tid, value)
+		}
+		return tgid, nil
+	}
+	return 0, fmt.Errorf("missing Tgid for task %d", tid)
+}
+
+func getProcessIOStat(procRoot string, pid int) (procfs.ProcIO, error) {
+	pio := procfs.ProcIO{}
+	data, putBuffer, err := readFileNoStat(filepath.Join(procRoot, strconv.Itoa(pid), "io"))
 	if err != nil {
 		return pio, err
 	}
-
-	ioFormat := "rchar: %d\nwchar: %d\nsyscr: %d\nsyscw: %d\n" +
-		"read_bytes: %d\nwrite_bytes: %d\n" +
-		"cancelled_write_bytes: %d\n"
-
-	_, err = fmt.Sscanf(string(data), ioFormat, &pio.RChar, &pio.WChar, &pio.SyscR,
-		&pio.SyscW, &pio.ReadBytes, &pio.WriteBytes, &pio.CancelledWriteBytes)
-
-	return pio, err
+	defer putBuffer()
+	return pio, parseProcIOStat(data, &pio)
 }
 
-func readFileNoStat(filename string) ([]byte, error) {
-	const maxBufferSize = 1024 * 512
+func parseProcIOStat(data []byte, pio *procfs.ProcIO) error {
+	for len(data) > 0 {
+		line := data
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line = data[:i]
+			data = data[i+1:]
+		} else {
+			data = nil
+		}
+		if len(line) == 0 {
+			continue
+		}
 
+		key, rawValue, ok := bytes.Cut(line, []byte(":"))
+		if !ok {
+			return fmt.Errorf("invalid proc io line %q", line)
+		}
+		value, err := strconv.ParseInt(string(bytes.TrimSpace(rawValue)), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid proc io value %q: %w", rawValue, err)
+		}
+
+		switch string(key) {
+		case "rchar":
+			pio.RChar = uint64(value)
+		case "wchar":
+			pio.WChar = uint64(value)
+		case "syscr":
+			pio.SyscR = uint64(value)
+		case "syscw":
+			pio.SyscW = uint64(value)
+		case "read_bytes":
+			pio.ReadBytes = uint64(value)
+		case "write_bytes":
+			pio.WriteBytes = uint64(value)
+		case "cancelled_write_bytes":
+			pio.CancelledWriteBytes = value
+		}
+	}
+	return nil
+}
+
+func readFileNoStat(filename string) ([]byte, func(), error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return nil, noopPutBuffer, err
 	}
 	defer f.Close()
 
-	reader := io.LimitReader(f, maxBufferSize)
-	return io.ReadAll(reader)
+	bufp := procIOBufferPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	reader := io.LimitReader(f, maxProcIOBufferSize)
+	for {
+		if len(buf) == cap(buf) {
+			if cap(buf) >= maxProcIOBufferSize {
+				break
+			}
+			newCap := cap(buf) * 2
+			if newCap == 0 {
+				newCap = 512
+			}
+			if newCap > maxProcIOBufferSize {
+				newCap = maxProcIOBufferSize
+			}
+			next := make([]byte, len(buf), newCap)
+			copy(next, buf)
+			buf = next
+		}
+		n, err := reader.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			*bufp = buf[:0]
+			procIOBufferPool.Put(bufp)
+			return nil, nil, err
+		}
+	}
+
+	return buf, func() {
+		*bufp = buf[:0]
+		procIOBufferPool.Put(bufp)
+	}, nil
 }

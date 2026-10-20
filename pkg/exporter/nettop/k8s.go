@@ -71,12 +71,6 @@ func NewPodCache() *PodCache {
 	}
 }
 
-// isCgroupV2 checks if system is using cgroup v2
-func isCgroupV2() bool {
-	_, err := os.Stat("/sys/fs/cgroup/cgroup.controllers")
-	return err == nil
-}
-
 // getSandboxPID finds sandbox container PID from cgroup tasks
 func (pc *PodCache) getSandboxPID(cgroupPath string) (int, error) {
 	var earliestTime time.Time
@@ -91,7 +85,11 @@ func (pc *PodCache) getSandboxPID(cgroupPath string) (int, error) {
 			return nil
 		}
 
-		tasksFile := filepath.Join(path, "tasks")
+		tasksFileName := "tasks"
+		if cgroupV2Mode {
+			tasksFileName = "cgroup.threads"
+		}
+		tasksFile := filepath.Join(path, tasksFileName)
 		content, err := os.ReadFile(tasksFile)
 		if err != nil {
 			return nil

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -34,15 +35,22 @@ func (k *KernelSymbol) GetExpr() string {
 }
 
 var kallsyms []KernelSymbol
+var kallsymsOnce sync.Once
+var kallsymsErr error
 
-func init() {
-	kallsyms = []KernelSymbol{}
-	if err := getAllSyms(); err != nil {
-		return
-	}
+func ensureKallsyms() error {
+	kallsymsOnce.Do(func() {
+		kallsyms = []KernelSymbol{}
+		kallsymsErr = getAllSyms()
+	})
+	return kallsymsErr
 }
 
 func GetSymByPt(addr string) (*KernelSymbol, error) {
+	if err := ensureKallsyms(); err != nil {
+		return nil, fmt.Errorf("load kallsyms: %w", err)
+	}
+
 	var pt uint64
 	if strings.HasPrefix(addr, "0x") {
 		addr = addr[2:]
@@ -83,6 +91,10 @@ var locationCache = expirable.NewLRU[uint64, KernelSymbol](100, nil, 0)
 
 // GetSymPtFromBpfLocation return symbol struct/offset/error with bpf location
 func GetSymPtFromBpfLocation(pt uint64) (*KernelSymbol, error) {
+	if err := ensureKallsyms(); err != nil {
+		return nil, fmt.Errorf("load kallsyms: %w", err)
+	}
+
 	sym, ok := locationCache.Get(pt)
 	if ok {
 		return &sym, nil

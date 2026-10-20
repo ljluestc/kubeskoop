@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/alibaba/kubeskoop/pkg/exporter/nettop"
 	"github.com/alibaba/kubeskoop/pkg/exporter/probe"
 
 	"github.com/alibaba/kubeskoop/pkg/exporter/bpfutil"
@@ -81,9 +82,26 @@ type linkFlowHelper interface {
 type dynamicLinkFlowHelper struct {
 	bpfObjs *bpfObjects
 	pattern string
-	done    chan struct{}
 	flows   map[int]*ebpfFlow
 	lock    sync.Mutex
+}
+
+func (h *dynamicLinkFlowHelper) OnLinkAdd(info nettop.LinkInfo) {
+	if !strings.HasPrefix(info.Name, h.pattern) {
+		return
+	}
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	h.tryStartLinkFlow(info.Link)
+}
+
+func (h *dynamicLinkFlowHelper) OnLinkDel(info nettop.LinkInfo) {
+	if !strings.HasPrefix(info.Name, h.pattern) {
+		return
+	}
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	h.tryStopLinkFlow(info.Name, info.Index)
 }
 
 func (h *dynamicLinkFlowHelper) tryStartLinkFlow(link netlink.Link) {
@@ -117,62 +135,18 @@ func (h *dynamicLinkFlowHelper) tryStopLinkFlow(name string, index int) {
 }
 
 func (h *dynamicLinkFlowHelper) start() error {
-	h.done = make(chan struct{})
-	ch := make(chan netlink.LinkUpdate)
-	links, err := netlink.LinkList()
-	if err != nil {
-		return fmt.Errorf("%s error list link, err: %w", probeName, err)
-	}
-	for _, link := range links {
-		if !strings.HasPrefix(link.Attrs().Name, h.pattern) {
-			continue
-		}
-		h.tryStartLinkFlow(link)
-	}
-	go func() {
-		if err := netlink.LinkSubscribe(ch, h.done); err != nil {
-			log.Errorf("%s error watch link change, err: %v", probeName, err)
-			close(h.done)
-		}
-	}()
-	go func() {
-		h.lock.Lock()
-		defer h.lock.Unlock()
-		for {
-			select {
-			case change := <-ch:
-				if !strings.HasSuffix(change.Attrs().Name, h.pattern) {
-					break
-				}
-				switch change.Header.Type {
-				case syscall.RTM_NEWLINK:
-					link, err := netlink.LinkByIndex(int(change.Index))
-					if err != nil {
-						log.Errorf("failed get new created link by index %d, name %s, err: %v", change.Index, change.Attrs().Name, err)
-						break
-					}
-					h.tryStartLinkFlow(link)
-				case syscall.RTM_DELLINK:
-					h.tryStopLinkFlow(change.Attrs().Name, int(change.Index))
-				}
-			case <-h.done:
-				return
-			}
-		}
-	}()
+	nettop.RegisterLinkListener(h)
 	return nil
 }
 
 func (h *dynamicLinkFlowHelper) stop() error {
-	close(h.done)
+	nettop.UnregisterLinkListener(h)
 	h.lock.Lock()
 	defer h.lock.Unlock()
 	var first error
 	for _, flow := range h.flows {
-		if err := flow.stop(); err != nil {
-			if first == nil {
-				first = err
-			}
+		if err := flow.stop(); err != nil && first == nil {
+			first = err
 		}
 	}
 	return first
@@ -202,7 +176,6 @@ func metricsProbeCreator(args flowArgs) (probe.MetricsProbe, error) {
 			p.helper = &dynamicLinkFlowHelper{
 				bpfObjs: &p.bpfObjs,
 				pattern: pattern,
-				done:    make(chan struct{}),
 				flows:   make(map[int]*ebpfFlow),
 			}
 		} else {

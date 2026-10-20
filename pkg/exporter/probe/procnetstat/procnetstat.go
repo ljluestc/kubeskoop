@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -94,9 +93,18 @@ var (
 		{Name: PFMemallocDrop, Help: "The total number of packets dropped due to PF_MEMALLOC allocations failing."},
 		{Name: TCPWqueueTooBig, Help: "The total number of TCP send queue drops due to the queue being too large."},
 	}
+
+	// wantedFields maps lowercase field name to metric name, built once at init.
+	wantedFields map[string]string
 )
 
 func init() {
+	// Build lookup map once: lowercase field name -> metric name.
+	wantedFields = make(map[string]string, len(TCPExtMetrics))
+	for _, m := range TCPExtMetrics {
+		wantedFields[m.Name] = m.Name
+	}
+
 	probe.MustRegisterMetricsProbe(probeName, netdevProbeCreator)
 }
 
@@ -135,78 +143,90 @@ func collect(nslist []*nettop.Entity) (map[string]map[uint32]uint64, error) {
 	}
 
 	for _, et := range nslist {
-		stats, err := getNetstatByPid(uint32(et.GetPid()))
-		if err != nil {
+		nsinum := uint32(et.GetNetns())
+		netstatpath := fmt.Sprintf("/proc/%d/net/netstat", et.GetPid())
+		if err := parseNetstatDirect(netstatpath, nsinum, resMap); err != nil {
 			log.Errorf("%s failed collect pid %d, err: %v", probeName, et.GetPid(), err)
+		}
+	}
+
+	return resMap, nil
+}
+
+// parseNetstatDirect reads /proc/<pid>/net/netstat and writes wanted metrics
+// directly into resMap, avoiding intermediate map[string]map[string]string allocations.
+func parseNetstatDirect(path string, nsinum uint32, resMap map[string]map[uint32]uint64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		headerLine := scanner.Text()
+		if !scanner.Scan() {
+			break
+		}
+		valueLine := scanner.Text()
+
+		// Only process TcpExt lines (protocol prefix before ':').
+		colonIdx := strings.IndexByte(headerLine, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		protocol := strings.ToLower(headerLine[:colonIdx])
+		if protocol != ProtocolTCPExt {
 			continue
 		}
 
-		extstats := stats[ProtocolTCPExt]
-		for _, stat := range TCPExtMetrics {
-			if _, ok := extstats[stat.Name]; ok {
-				data, err := strconv.ParseUint(extstats[stat.Name], 10, 64)
-				if err != nil {
-					log.Errorf("%s failed parse stat %s, pid: %d err: %v", probeName, stat, et.GetPid(), err)
-					continue
+		// Walk both lines field-by-field without allocating slices.
+		hi := colonIdx + 1
+		vi := strings.IndexByte(valueLine, ':')
+		if vi < 0 {
+			continue
+		}
+		vi++
+
+		hLen := len(headerLine)
+		vLen := len(valueLine)
+
+		for {
+			// Skip whitespace in header
+			for hi < hLen && headerLine[hi] == ' ' {
+				hi++
+			}
+			if hi >= hLen {
+				break
+			}
+			// Find end of header field
+			hStart := hi
+			for hi < hLen && headerLine[hi] != ' ' {
+				hi++
+			}
+			fieldName := strings.ToLower(headerLine[hStart:hi])
+
+			// Skip whitespace in value
+			for vi < vLen && valueLine[vi] == ' ' {
+				vi++
+			}
+			// Find end of value field
+			vStart := vi
+			for vi < vLen && valueLine[vi] != ' ' {
+				vi++
+			}
+
+			// Only parse if this field is one we want.
+			if metricName, ok := wantedFields[fieldName]; ok {
+				if vStart < vi {
+					val, err := strconv.ParseUint(valueLine[vStart:vi], 10, 64)
+					if err == nil {
+						resMap[metricName][nsinum] += val
+					}
 				}
-				resMap[stat.Name][uint32(et.GetNetns())] += data
 			}
 		}
 	}
 
-	return resMap, nil
-}
-
-func getNetstatByPid(pid uint32) (map[string]map[string]string, error) {
-	resMap := make(map[string]map[string]string)
-	netstatpath := fmt.Sprintf("/proc/%d/net/netstat", pid)
-	if _, err := os.Stat(netstatpath); os.IsNotExist(err) {
-		return resMap, err
-	}
-
-	netStats, err := getNetStats(netstatpath)
-	if err != nil {
-		return resMap, err
-	}
-
-	for k, v := range netStats {
-		resMap[k] = v
-	}
-
-	return resMap, nil
-}
-
-func getNetStats(fileName string) (map[string]map[string]string, error) {
-	file, err := os.Open(fileName)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	return parseNetStats(file, fileName)
-}
-
-func parseNetStats(r io.Reader, fileName string) (map[string]map[string]string, error) {
-	var (
-		netStats = map[string]map[string]string{}
-		scanner  = bufio.NewScanner(r)
-	)
-
-	for scanner.Scan() {
-		nameParts := strings.Split(scanner.Text(), " ")
-		scanner.Scan()
-		valueParts := strings.Split(scanner.Text(), " ")
-		// Remove trailing :.
-		protocol := strings.ToLower(nameParts[0][:len(nameParts[0])-1])
-		netStats[protocol] = map[string]string{}
-		if len(nameParts) != len(valueParts) {
-			return nil, fmt.Errorf("mismatch field count mismatch in %s: %s",
-				fileName, protocol)
-		}
-		for i := 1; i < len(nameParts); i++ {
-			netStats[protocol][strings.ToLower(nameParts[i])] = valueParts[i]
-		}
-	}
-
-	return netStats, scanner.Err()
+	return scanner.Err()
 }

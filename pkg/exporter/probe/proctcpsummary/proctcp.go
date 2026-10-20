@@ -3,13 +3,11 @@ package proctcpsummary
 import (
 	"bufio"
 	"context"
-	"encoding/hex"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"strconv"
-	"strings"
+	"sync"
+	"time"
 
 	"github.com/alibaba/kubeskoop/pkg/exporter/probe"
 	log "github.com/sirupsen/logrus"
@@ -43,36 +41,27 @@ const (
 	TCPTimewait    = 6
 	TCPCloseWait   = 8
 	TCPListen      = 10
-
-	readLimit = 4294967296 // Byte -> 4 GiB
 )
 
-type (
-	NetIPSocket []*netIPSocketLine
+type tcpSummary struct {
+	established uint64
+	timeWait    uint64
+	closeWait   uint64
+	synSent     uint64
+	synRecv     uint64
+	txQueue     uint64
+	rxQueue     uint64
+}
 
-	NetIPSocketSummary struct {
-		TxQueueLength uint64
-		RxQueueLength uint64
-		UsedSockets   uint64
-	}
-
-	netIPSocketLine struct {
-		Sl        uint64
-		LocalAddr net.IP
-		LocalPort uint64
-		RemAddr   net.IP
-		RemPort   uint64
-		St        uint64
-		TxQueue   uint64
-		RxQueue   uint64
-		UID       uint64
-		Inode     uint64
-	}
-
-	NetTCP []*netIPSocketLine
-
-	NetTCPSummary NetIPSocketSummary
-)
+func (s *tcpSummary) add(other *tcpSummary) {
+	s.established += other.established
+	s.timeWait += other.timeWait
+	s.closeWait += other.closeWait
+	s.synSent += other.synSent
+	s.synRecv += other.synRecv
+	s.txQueue += other.txQueue
+	s.rxQueue += other.rxQueue
+}
 
 var (
 	TCPSummaryMetrics = []probe.LegacyMetric{
@@ -86,7 +75,45 @@ var (
 	}
 
 	probeName = "tcpsummary"
+
+	collectCacheTTL = 2 * time.Second
 )
+
+// collectCache caches the result of collect() to avoid re-reading all
+// /proc/net/tcp files on every Prometheus scrape. The kernel generates
+// proc file content on each read by iterating the TCP hash table, so
+// reading 118 files per second is expensive. With a 2s TTL, rapid scrapes
+// (e.g. 1s interval) reuse cached results.
+type collectCache struct {
+	mu     sync.Mutex
+	result map[string]map[uint32]uint64
+	last   time.Time
+}
+
+var tcpCache = &collectCache{}
+
+func (c *collectCache) get() (map[string]map[uint32]uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if time.Since(c.last) > collectCacheTTL {
+		ets := nettop.GetAllUniqueNetnsEntity()
+		if len(ets) == 0 {
+			log.Infof("failed collect tcp summary, no entity found")
+		}
+
+		sockDiagOnce.Do(probeSockDiagSupport)
+		if useSockDiag {
+			c.result = collectSockDiag(ets)
+		} else {
+			log.Debugf("sock_diag unavailable (%v), using proc", useSockDiagErr)
+			c.result = collect(ets)
+		}
+		c.last = time.Now()
+	}
+
+	return c.result, nil
+}
 
 func init() {
 	probe.MustRegisterMetricsProbe(probeName, softNetProbeCreator)
@@ -112,11 +139,7 @@ func (s *ProcTCP) Stop(_ context.Context) error {
 }
 
 func (s *ProcTCP) CollectOnce() (map[string]map[uint32]uint64, error) {
-	ets := nettop.GetAllUniqueNetnsEntity()
-	if len(ets) == 0 {
-		log.Infof("failed collect tcp summary, no entity found")
-	}
-	return collect(ets), nil
+	return tcpCache.get()
 }
 
 func collect(pidlist []*nettop.Entity) map[string]map[uint32]uint64 {
@@ -127,190 +150,146 @@ func collect(pidlist []*nettop.Entity) map[string]map[uint32]uint64 {
 	}
 
 	for idx := range pidlist {
-		path := fmt.Sprintf("/proc/%d/net/tcp", pidlist[idx].GetPid())
-		summary, err := newNetTCP(path)
-		if err != nil {
-			log.Warnf("failed collect tcp, path %s, err: %v", path, err)
-			continue
-		}
-		summary6, err := newNetTCP(fmt.Sprintf("/proc/%d/net/tcp6", pidlist[idx].GetPid()))
-		if err != nil {
-			log.Warnf("failed collect tcp6, path %s, err: %v", path, err)
-			continue
-		}
-		est, tw, cw, ss, sr := summary.getEstTwCount()
-		est6, tw6, cw6, ss6, sr6 := summary6.getEstTwCount()
-		tx, rx := summary.getTxRxQueueLength()
-		tx6, rx6 := summary6.getTxRxQueueLength()
+		pid := pidlist[idx].GetPid()
 		nsinum := uint32(pidlist[idx].GetNetns())
-		resMap[TCPEstablishedConn][nsinum] = est + est6
-		resMap[TCPTimeWaitConn][nsinum] = tw + tw6
-		resMap[TCPCloseWaitConn][nsinum] = cw + cw6
-		resMap[TCPSynSentConn][nsinum] = ss + ss6
-		resMap[TCPSynRecvConn][nsinum] = sr + sr6
-		resMap[TCPTXQueue][nsinum] = tx + tx6
-		resMap[TCPRXQueue][nsinum] = rx + rx6
+
+		var combined tcpSummary
+		for _, proto := range []string{"tcp", "tcp6"} {
+			path := fmt.Sprintf("/proc/%d/net/%s", pid, proto)
+			s, err := collectTCPSummary(path)
+			if err != nil {
+				log.Warnf("failed collect %s, path %s, err: %v", proto, path, err)
+				continue
+			}
+			combined.add(&s)
+		}
+
+		resMap[TCPEstablishedConn][nsinum] = combined.established
+		resMap[TCPTimeWaitConn][nsinum] = combined.timeWait
+		resMap[TCPCloseWaitConn][nsinum] = combined.closeWait
+		resMap[TCPSynSentConn][nsinum] = combined.synSent
+		resMap[TCPSynRecvConn][nsinum] = combined.synRecv
+		resMap[TCPTXQueue][nsinum] = combined.txQueue
+		resMap[TCPRXQueue][nsinum] = combined.rxQueue
 	}
 
 	return resMap
 }
 
-func (n NetTCP) getEstTwCount() (est, tw, cw, ss, sr uint64) {
-	for idx := range n {
-		switch n[idx].St {
-		case TCPEstablished:
-			est++
-		case TCPTimewait:
-			tw++
-		case TCPCloseWait:
-			cw++
-		case TCPSynSent:
-			ss++
-		case TCPSynRecv:
-			sr++
-		}
-	}
-	return est, tw, cw, ss, sr
-}
-
-func (n NetTCP) getTxRxQueueLength() (tx uint64, rx uint64) {
-	for idx := range n {
-		if n[idx].St != TCPListen {
-			tx += n[idx].TxQueue
-			rx += n[idx].RxQueue
-		}
-	}
-	return tx, rx
-}
-
-// newNetTCP creates a new NetTCP{,6} from the contents of the given file.
-func newNetTCP(file string) (NetTCP, error) {
-	n, err := newNetIPSocket(file)
-	n1 := NetTCP(n)
-	return n1, err
-}
-
-func newNetIPSocket(file string) (NetIPSocket, error) {
+// collectTCPSummary reads a /proc/{pid}/net/tcp{,6} file and accumulates
+// state counts and queue lengths in a single pass. Only fields 3 (st) and
+// 4 (tx_queue:rx_queue) are parsed; IP addresses, ports, UID, and inode
+// are skipped entirely to avoid unnecessary allocations and CPU.
+func collectTCPSummary(file string) (tcpSummary, error) {
+	var s tcpSummary
 	f, err := os.Open(file)
 	if err != nil {
-		return nil, err
+		return s, err
 	}
 	defer f.Close()
 
-	var netIPSocket NetIPSocket
-
-	lr := io.LimitReader(f, readLimit)
-	s := bufio.NewScanner(lr)
-	s.Scan() // skip first line with headers
-	for s.Scan() {
-		fields := strings.Fields(s.Text())
-		line, err := parseNetIPSocketLine(fields)
+	scanner := bufio.NewScanner(f)
+	scanner.Scan() // skip header line
+	for scanner.Scan() {
+		line := scanner.Text()
+		st, txq, rxq, err := parseStAndQueues(line)
 		if err != nil {
-			return nil, err
+			continue // skip malformed lines
 		}
-		netIPSocket = append(netIPSocket, line)
+		switch st {
+		case TCPEstablished:
+			s.established++
+		case TCPTimewait:
+			s.timeWait++
+		case TCPCloseWait:
+			s.closeWait++
+		case TCPSynSent:
+			s.synSent++
+		case TCPSynRecv:
+			s.synRecv++
+		}
+		if st != TCPListen {
+			s.txQueue += txq
+			s.rxQueue += rxq
+		}
 	}
-	if err := s.Err(); err != nil {
-		return nil, err
-	}
-	return netIPSocket, nil
+	return s, scanner.Err()
 }
 
-// parseNetIPSocketLine parses a single line, represented by a list of fields.
-func parseNetIPSocketLine(fields []string) (*netIPSocketLine, error) {
-	line := &netIPSocketLine{}
-	if len(fields) < 10 {
-		return nil, fmt.Errorf(
-			"cannot parse net socket line as it has less then 10 columns %q",
-			strings.Join(fields, " "),
-		)
-	}
-	var err error // parse error
+// parseStAndQueues extracts the st (field 3) and tx_queue:rx_queue (field 4)
+// from a /proc/net/tcp line by index-based scanning, without allocating
+// intermediate slices or strings.
+//
+// /proc/net/tcp line format:
+//
+//	sl  local_address rem_address   st tx_queue:rx_queue ...
+//	0:  0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 ...
+//
+// Fields are separated by whitespace. We skip to field 3 (st) and field 4
+// (tx_queue:rx_queue) using manual index advancement.
+func parseStAndQueues(line string) (st, txq, rxq uint64, err error) {
+	n := len(line)
+	i := 0
 
-	// sl
-	s := strings.Split(fields[0], ":")
-	if len(s) != 2 {
-		return nil, fmt.Errorf("cannot parse sl field in socket line %q", fields[0])
-	}
-
-	if line.Sl, err = strconv.ParseUint(s[0], 0, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse sl value in socket line: %w", err)
-	}
-	// local_address
-	l := strings.Split(fields[1], ":")
-	if len(l) != 2 {
-		return nil, fmt.Errorf("cannot parse local_address field in socket line %q", fields[1])
-	}
-	if line.LocalAddr, err = parseIP(l[0]); err != nil {
-		return nil, err
-	}
-	if line.LocalPort, err = strconv.ParseUint(l[1], 16, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse local_address port value in socket line: %w", err)
+	// Skip 3 fields (sl, local_address, rem_address) to reach st (field 3)
+	for field := 0; field < 3; field++ {
+		// skip leading whitespace
+		for i < n && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		// skip field content
+		for i < n && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
 	}
 
-	// remote_address
-	r := strings.Split(fields[2], ":")
-	if len(r) != 2 {
-		return nil, fmt.Errorf("cannot parse rem_address field in socket line %q", fields[1])
+	// skip whitespace before st field
+	for i < n && (line[i] == ' ' || line[i] == '\t') {
+		i++
 	}
-	if line.RemAddr, err = parseIP(r[0]); err != nil {
-		return nil, err
+	// extract st (hex)
+	start := i
+	for i < n && line[i] != ' ' && line[i] != '\t' {
+		i++
 	}
-	if line.RemPort, err = strconv.ParseUint(r[1], 16, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse rem_address port value in socket line: %w", err)
+	if start == i {
+		return 0, 0, 0, fmt.Errorf("missing st field")
 	}
-
-	// st
-	if line.St, err = strconv.ParseUint(fields[3], 16, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse st value in socket line: %w", err)
-	}
-
-	// tx_queue and rx_queue
-	q := strings.Split(fields[4], ":")
-	if len(q) != 2 {
-		return nil, fmt.Errorf(
-			"cannot parse tx/rx queues in socket line as it has a missing colon %q",
-			fields[4],
-		)
-	}
-	if line.TxQueue, err = strconv.ParseUint(q[0], 16, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse tx_queue value in socket line: %w", err)
-	}
-	if line.RxQueue, err = strconv.ParseUint(q[1], 16, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse rx_queue value in socket line: %w", err)
-	}
-
-	// uid
-	if line.UID, err = strconv.ParseUint(fields[7], 0, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse uid value in socket line: %w", err)
-	}
-
-	// inode
-	if line.Inode, err = strconv.ParseUint(fields[9], 0, 64); err != nil {
-		return nil, fmt.Errorf("cannot parse inode value in socket line: %w", err)
-	}
-
-	return line, nil
-}
-
-func parseIP(hexIP string) (net.IP, error) {
-	var byteIP []byte
-	byteIP, err := hex.DecodeString(hexIP)
+	st, err = strconv.ParseUint(line[start:i], 16, 64)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse address field in socket line %q", hexIP)
+		return 0, 0, 0, err
 	}
-	switch len(byteIP) {
-	case 4:
-		return net.IP{byteIP[3], byteIP[2], byteIP[1], byteIP[0]}, nil
-	case 16:
-		i := net.IP{
-			byteIP[3], byteIP[2], byteIP[1], byteIP[0],
-			byteIP[7], byteIP[6], byteIP[5], byteIP[4],
-			byteIP[11], byteIP[10], byteIP[9], byteIP[8],
-			byteIP[15], byteIP[14], byteIP[13], byteIP[12],
-		}
-		return i, nil
-	default:
-		return nil, fmt.Errorf("unable to parse IP %s", hexIP)
+
+	// skip whitespace before tx_queue:rx_queue field
+	for i < n && (line[i] == ' ' || line[i] == '\t') {
+		i++
 	}
+	// extract tx_queue (hex, before ':')
+	start = i
+	for i < n && line[i] != ':' {
+		i++
+	}
+	if i >= n {
+		return 0, 0, 0, fmt.Errorf("missing queue field")
+	}
+	txq, err = strconv.ParseUint(line[start:i], 16, 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	// skip ':'
+	i++
+	// extract rx_queue (hex, until whitespace)
+	start = i
+	for i < n && line[i] != ' ' && line[i] != '\t' {
+		i++
+	}
+	if start == i {
+		return 0, 0, 0, fmt.Errorf("missing rx_queue field")
+	}
+	rxq, err = strconv.ParseUint(line[start:i], 16, 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	return st, txq, rxq, nil
 }

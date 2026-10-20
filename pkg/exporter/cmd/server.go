@@ -74,6 +74,12 @@ var (
 
 			defer nettop.StopCache()
 
+			if err = nettop.StartLinkManager(); err != nil {
+				log.Errorf("failed start link manager: %v", err)
+				return
+			}
+			defer nettop.StopLinkManager()
+
 			if cfg.EnableController {
 				if cfg.ControllerAddr == "" {
 					log.Infof("controller address is empty, use dns:controller:10263 as default")
@@ -274,6 +280,7 @@ func (i *inspServer) reload() error {
 	}
 
 	ctx := context.TODO()
+	i.metricsServer.SetDisableCompression(cfg.MetricsConfig.DisableCompression)
 
 	err = i.metricsServer.Reload(ctx, cfg.MetricsConfig.Probes)
 	if err != nil {
@@ -370,7 +377,7 @@ func (i *inspServer) start(cfg *InspServerConfig) error {
 		return fmt.Errorf("failed init additional labels: %w", err)
 	}
 
-	i.metricsServer, err = newMetricsServer()
+	i.metricsServer, err = newMetricsServer(cfg.MetricsConfig)
 	if err != nil {
 		return fmt.Errorf("failed create metrics server: %w", err)
 	}

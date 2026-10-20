@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -137,9 +136,31 @@ var (
 	cache = &snmpCache{
 		cache: make(map[string]map[string]map[uint32]uint64),
 	}
+
+	// wantedSnmpFields: lowercase protocol -> lowercase field name -> (proto key, metric name).
+	// Built once at init to avoid per-call allocations.
+	wantedSnmpFields map[string]map[string]wantedField
 )
 
+type wantedField struct {
+	protoKey   string
+	metricName string
+}
+
 func init() {
+	// Build the lookup table once.
+	wantedSnmpFields = make(map[string]map[string]wantedField)
+	for protoKey, metricsList := range metricsMap {
+		for _, m := range metricsList {
+			// /proc/net/snmp uses "Tcp", "Udp", "Ip" as protocol prefix.
+			// After lowercasing, "tcp" maps to protoKey "tcp", etc.
+			if wantedSnmpFields[protoKey] == nil {
+				wantedSnmpFields[protoKey] = make(map[string]wantedField)
+			}
+			wantedSnmpFields[protoKey][m.Name] = wantedField{protoKey: protoKey, metricName: m.Name}
+		}
+	}
+
 	probe.MustRegisterMetricsProbe(TCP, newSnmpProbeCreator(TCP))
 	probe.MustRegisterMetricsProbe(UDP, newSnmpProbeCreator(UDP))
 	probe.MustRegisterMetricsProbe(IP, newSnmpProbeCreator(IP))
@@ -214,27 +235,10 @@ func collect() (map[string]map[string]map[uint32]uint64, error) {
 	for _, et := range entitys {
 		if et != nil {
 			pid := et.GetPid()
-			nsinum := et.GetNetns()
-
-			stats, err := getNetstatByPid(pid)
-			if err != nil {
-				log.Errorf("%s failed get netstat, pid: %d, nsinum: %d, err: %v", "snmp", pid, nsinum, err)
-				continue
-			}
-
-			for proto, stat := range stats {
-				for k, v := range stat {
-					data, err := strconv.ParseInt(v, 10, 64)
-					if err != nil {
-						log.Errorf("%s failed parse netstat value, pid: %d, nsinum: %d, key: %s value: %s, err: %v", "snmp", pid, nsinum, k, v, err)
-						continue
-					}
-					// ignore unaware metric
-
-					if _, ok := res[proto][k]; ok {
-						res[proto][k][uint32(nsinum)] = uint64(data)
-					}
-				}
+			nsinum := uint32(et.GetNetns())
+			snmppath := fmt.Sprintf("/proc/%d/net/snmp", pid)
+			if err := parseSnmpDirect(snmppath, nsinum, res); err != nil {
+				log.Errorf("snmp failed collect pid %d, nsinum %d, err: %v", pid, nsinum, err)
 			}
 		}
 	}
@@ -242,56 +246,75 @@ func collect() (map[string]map[string]map[uint32]uint64, error) {
 	return res, nil
 }
 
-func getNetstatByPid(pid int) (map[string]map[string]string, error) {
-	resMap := make(map[string]map[string]string)
-
-	snmppath := fmt.Sprintf("/proc/%d/net/snmp", pid)
-	if _, err := os.Stat(snmppath); os.IsNotExist(err) {
-		return resMap, err
-	}
-	snmpStats, err := getNetStats(snmppath)
+// parseSnmpDirect reads /proc/<pid>/net/snmp and writes wanted metrics
+// directly into res, avoiding intermediate map[string]map[string]string allocations.
+func parseSnmpDirect(path string, nsinum uint32, res map[string]map[string]map[uint32]uint64) error {
+	f, err := os.Open(path)
 	if err != nil {
-		return resMap, err
+		return err
 	}
+	defer f.Close()
 
-	for k, v := range snmpStats {
-		resMap[k] = v
-	}
-
-	return resMap, nil
-}
-
-func getNetStats(fileName string) (map[string]map[string]string, error) {
-	file, err := os.Open(fileName)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	return parseNetStats(file, fileName)
-}
-
-func parseNetStats(r io.Reader, fileName string) (map[string]map[string]string, error) {
-	var (
-		netStats = map[string]map[string]string{}
-		scanner  = bufio.NewScanner(r)
-	)
-
+	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		nameParts := strings.Split(scanner.Text(), " ")
-		scanner.Scan()
-		valueParts := strings.Split(scanner.Text(), " ")
-		// Remove trailing :.
-		protocol := strings.ToLower(nameParts[0][:len(nameParts[0])-1])
-		netStats[protocol] = map[string]string{}
-		if len(nameParts) != len(valueParts) {
-			return nil, fmt.Errorf("mismatch field count mismatch in %s: %s",
-				fileName, protocol)
+		headerLine := scanner.Text()
+		if !scanner.Scan() {
+			break
 		}
-		for i := 1; i < len(nameParts); i++ {
-			netStats[protocol][strings.ToLower(nameParts[i])] = valueParts[i]
+		valueLine := scanner.Text()
+
+		colonIdx := strings.IndexByte(headerLine, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		protocol := strings.ToLower(headerLine[:colonIdx])
+
+		protoFields, ok := wantedSnmpFields[protocol]
+		if !ok {
+			continue
+		}
+
+		hi := colonIdx + 1
+		vi := strings.IndexByte(valueLine, ':')
+		if vi < 0 {
+			continue
+		}
+		vi++
+
+		hLen := len(headerLine)
+		vLen := len(valueLine)
+
+		for {
+			for hi < hLen && headerLine[hi] == ' ' {
+				hi++
+			}
+			if hi >= hLen {
+				break
+			}
+			hStart := hi
+			for hi < hLen && headerLine[hi] != ' ' {
+				hi++
+			}
+			fieldName := strings.ToLower(headerLine[hStart:hi])
+
+			for vi < vLen && valueLine[vi] == ' ' {
+				vi++
+			}
+			vStart := vi
+			for vi < vLen && valueLine[vi] != ' ' {
+				vi++
+			}
+
+			if wf, ok := protoFields[fieldName]; ok {
+				if vStart < vi {
+					val, err := strconv.ParseInt(valueLine[vStart:vi], 10, 64)
+					if err == nil {
+						res[wf.protoKey][wf.metricName][nsinum] = uint64(val)
+					}
+				}
+			}
 		}
 	}
 
-	return netStats, scanner.Err()
+	return scanner.Err()
 }
